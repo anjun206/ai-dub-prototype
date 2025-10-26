@@ -1,0 +1,16 @@
+# 기본적으로 모든 파일 무시
+/*
+
+# 단, .gitignore 자신과 README는 허용
+!.gitignore
+!README.md
+
+# backend 폴더는 통과
+!/backend/
+
+# backend 안에서도 기본은 무시
+/backend/*
+
+# 단, app만 추적
+!/backend/app/
+!/backend/app/**
