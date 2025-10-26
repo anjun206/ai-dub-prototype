@@ -1,16 +1,24 @@
-# 기본적으로 모든 파일 무시
+# 0) 기본적으로 전부 무시
 /*
 
-# 단, .gitignore 자신과 README는 허용
+# 1) 루트에서 허용할 파일(화이트리스트)
 !.gitignore
 !README.md
+!Dockerfile
+!docker-compose.yml
+!requirements.txt
 
-# backend 폴더는 통과
+# 2) backend 디렉터리만 통과
 !/backend/
 
-# backend 안에서도 기본은 무시
+# 3) backend 내부는 기본 무시
 /backend/*
 
-# 단, app만 추적
+# 4) 단, app만 추적
 !/backend/app/
 !/backend/app/**
+
+# 5) app 내부에서도 추적 제외할 흔한 것들
+/backend/app/**/__pycache__/
+/backend/app/**/*.pyc
+/backend/app/**/*.pyo
