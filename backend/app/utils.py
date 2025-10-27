@@ -4,6 +4,7 @@ import os
 from typing import List, Tuple, Optional, Dict
 import re
 import tempfile
+import math
 
 # -------------------- 공용 실행/시간 유틸 --------------------
 
@@ -150,3 +151,63 @@ def segment_boundaries(duration: float, silences):
         is_sil = any(abs(start - s) < 1e-3 and abs(end - e) < 1e-3 for s,e in silences)
         out.append((start, end, is_sil))
     return out
+
+def cut_wav_segment(src: str, dst: str, start: float, end: float, ar: int = 24000):
+    start = max(0.0, float(start)); end = max(start, float(end))
+    run(f'ffmpeg -y -ss {start:.6f} -to {end:.6f} -i {shlex.quote(src)} -ar {ar} -ac 1 {shlex.quote(dst)}')
+
+def _nearest_silence_time(target: float, silences, window: float = 0.25):
+    """
+    target 근처(±window초)에서 가장 가까운 무음 중앙점(mid)을 반환.
+    없으면 None.
+    """
+    best_t, best_d = None, 1e9
+    for s,e in silences:
+        mid = 0.5*(s+e)
+        if (target - window) <= mid <= (target + window):
+            d = abs(mid - target)
+            if d < best_d:
+                best_d, best_t = d, mid
+    return best_t
+
+def split_audio_by_targets(raw_wav: str, target_durations: list[float], out_dir: str, prefix: str,
+                           search_window: float = 0.25, ar: int = 24000) -> list[str]:
+    """
+    raw_wav을 target durations(슬롯 길이들)의 누적합 경계에 맞춰 N개로 자름.
+    각 경계는 '근처 무음(mid)'로 스냅(없으면 그 시간 그대로).
+    반환: 잘린 WAV 경로 리스트 길이 == len(target_durations)
+    """
+    total = ffprobe_duration(raw_wav)
+    targets = [max(0.05, float(d)) for d in target_durations]
+    # 경계 후보 (0, t1, t2, ..., total or sum(targets))
+    cum = [0.0]
+    acc = 0.0
+    for d in targets[:-1]:  # 마지막 경계는 total에 맡긴다(언더/오버라도 자투리 흡수)
+        acc += d; cum.append(acc)
+    # 실제 총합과 raw 길이 차이를 고려
+    raw_end = total
+    boundaries = [0.0] + [min(max(0.0, t), raw_end) for t in cum[1:]] + [raw_end]
+
+    # 무음에 스냅
+    sils = detect_silences(raw_wav, noise_db="-35dB", min_s=0.08)
+    snapped = [boundaries[0]]
+    for t in boundaries[1:-1]:
+        snap = _nearest_silence_time(t, sils, window=search_window)
+        snapped.append(snap if snap is not None else t)
+    snapped.append(boundaries[-1])
+
+    # 단조성 보정(겹침 제거)
+    for i in range(1, len(snapped)):
+        if snapped[i] <= snapped[i-1] + 1e-3:
+            snapped[i] = snapped[i-1] + 1e-3
+    if snapped[-1] < snapped[-2] + 0.02:
+        snapped[-1] = snapped[-2] + 0.02
+
+    # 컷
+    outs = []
+    for i in range(len(targets)):
+        s, e = snapped[i], snapped[i+1]
+        part = os.path.join(out_dir, f"{prefix}_part_{i:02d}.wav")
+        cut_wav_segment(raw_wav, part, s, e, ar=ar)
+        outs.append(part)
+    return outs

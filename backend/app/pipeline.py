@@ -12,7 +12,8 @@ from .translate import translate_texts
 from .tts import synthesize
 from .utils import (
     run, ffprobe_duration, make_silence, time_stretch,
-    trim_or_pad_to_duration, concat_audio, replace_audio_in_video
+    trim_or_pad_to_duration, concat_audio, replace_audio_in_video,
+    split_audio_by_targets, 
 )
 from .utils_meta import load_meta, save_meta
 
@@ -119,20 +120,14 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
 
 # ----------------- 2차 TTS: 최종 보정/결합(Finalize) -----------------
 async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[UploadFile]):
-    """
-    다시 TTS 합성 후 각 세그먼트별로:
-      - raw_dur > slot → tempo = raw/slot 로 '빠르게' 줄여 정확히 맞춤
-      - raw_dur <= slot → 뒤 무음 패드로 정확히 맞춤
-    절대좌표로 리딩갭/세그 간 갭을 삽입해 최종 오디오 결합.
-    """
     assert target_lang in ("en", "ja")
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
-    assert "translations" in meta, "No translations"
-    assert "wav_16k" in meta and "input" in meta, "Invalid meta"
+    assert "translations" in meta and "wav_16k" in meta and "input" in meta
 
     trs: List[Dict] = meta["translations"]
     ref = _ensure_ref_voice(work, meta["wav_16k"], ref_voice)
+    layout = meta.get("merge_layouts", {})  # new_index 기준
 
     parts: List[str] = []
     final_report: List[Dict] = []
@@ -140,42 +135,68 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     # 리딩 갭
     lead = max(0.0, float(trs[0]["start"]))
     if lead > 0.0001:
-        lead_wav = os.path.join(work, "lead.wav")
-        make_silence(lead_wav, lead, ar=24000)
-        parts.append(lead_wav)
+        lead_wav = os.path.join(work, "lead.wav"); make_silence(lead_wav, lead, ar=24000); parts.append(lead_wav)
 
     for i, tr in enumerate(trs):
         start = float(tr["start"]); end = float(tr["end"])
         slot = max(0.05, end - start)
 
-        raw = os.path.join(work, f"final_{i:04d}_raw.wav")
-        synthesize(tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL)
-        raw_dur = ffprobe_duration(raw)
+        # 이 번역 세그가 머지된 것인지 확인
+        lay = layout.get(i)
+        if lay and len(lay.get("slots", [])) > 1:
+            # 🔹 머지된 세그먼트: 텍스트 1번 합성 → 원본 슬롯 길이에 따라 '스마트 컷'
+            raw_all = os.path.join(work, f"final_{i:04d}_raw_all.wav")
+            synthesize(tr["text"], ref, language=target_lang, out_path=raw_all, model_name=TTS_MODEL)
+            slot_durs = [max(0.05, float(s["end"]) - float(s["start"])) for s in lay["slots"]]
+            inner_gaps = [max(0.0, float(g)) for g in lay.get("gaps", [])]
 
-        fit = os.path.join(work, f"final_{i:04d}_slot.wav")
-        if raw_dur > slot + EPS:
-            # over → 속도 줄여 맞춤 (빠르게: tempo = raw/slot)
-            tempo = raw_dur / slot
-            tmp = fit.replace(".wav", "_tempo.wav")
-            time_stretch(raw, tmp, tempo=tempo, ar=24000)
-            info = trim_or_pad_to_duration(tmp, fit, slot, ar=24000)
-            final_report.append({
-                "i": i, "mode": "speedup", "tempo": tempo,
-                "raw_dur": raw_dur, "slot_dur": slot,
-                "padded": info["padded"], "trimmed": info["trimmed"]
-            })
+            # 무음 스냅 컷
+            chunks = split_audio_by_targets(raw_all, slot_durs, work, f"final_{i:04d}")
+            # 각 슬롯별 규칙 적용(오버=배속, 레스=패드)
+            for j, ch in enumerate(chunks):
+                ch_dur = ffprobe_duration(ch); tgt = slot_durs[j]
+                outp = os.path.join(work, f"final_{i:04d}_slot_{j:02d}.wav")
+                if ch_dur > tgt + EPS:
+                    tempo = ch_dur / tgt
+                    tmp = outp.replace(".wav", "_tempo.wav")
+                    time_stretch(ch, tmp, tempo=tempo, ar=24000)
+                    info = trim_or_pad_to_duration(tmp, outp, tgt, ar=24000)
+                    final_report.append({"i": i, "sub": j, "mode": "speedup", "tempo": tempo,
+                                         "raw_dur": ch_dur, "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
+                else:
+                    info = trim_or_pad_to_duration(ch, outp, tgt, ar=24000)
+                    final_report.append({"i": i, "sub": j, "mode": "pad",
+                                         "raw_dur": ch_dur, "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
+                parts.append(outp)
+
+                # 내부 갭 삽입
+                if j < len(inner_gaps):
+                    gap = inner_gaps[j]
+                    if gap > 0.0001:
+                        g = os.path.join(work, f"final_{i:04d}_gap_{j:02d}.wav")
+                        make_silence(g, gap, ar=24000)
+                        parts.append(g)
         else:
-            # less/fit → 무음 패드로 정확히 맞춤
-            info = trim_or_pad_to_duration(raw, fit, slot, ar=24000)
-            final_report.append({
-                "i": i, "mode": "pad",
-                "raw_dur": raw_dur, "slot_dur": slot,
-                "padded": info["padded"], "trimmed": info["trimmed"]
-            })
+            # 🔸 일반(머지 아님 or 단일 슬롯) 처리: 기존 규칙
+            raw = os.path.join(work, f"final_{i:04d}_raw.wav")
+            synthesize(tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL)
+            raw_dur = ffprobe_duration(raw)
 
-        parts.append(fit)
+            fit = os.path.join(work, f"final_{i:04d}_slot.wav")
+            if raw_dur > slot + EPS:
+                tempo = raw_dur / slot
+                tmp = fit.replace(".wav", "_tempo.wav")
+                time_stretch(raw, tmp, tempo=tempo, ar=24000)
+                info = trim_or_pad_to_duration(tmp, fit, slot, ar=24000)
+                final_report.append({"i": i, "mode": "speedup", "tempo": tempo,
+                                     "raw_dur": raw_dur, "slot_dur": slot, "padded": info["padded"], "trimmed": info["trimmed"]})
+            else:
+                info = trim_or_pad_to_duration(raw, fit, slot, ar=24000)
+                final_report.append({"i": i, "mode": "pad",
+                                     "raw_dur": raw_dur, "slot_dur": slot, "padded": info["padded"], "trimmed": info["trimmed"]})
+            parts.append(fit)
 
-        # 세그 간 절대 갭
+        # 번역 세그 간 외부 절대 갭
         if i < len(trs) - 1:
             next_start = float(trs[i+1]["start"])
             gap = max(0.0, next_start - end)
@@ -184,7 +205,7 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
                 make_silence(g, gap, ar=24000)
                 parts.append(g)
 
-    # 24k concat → 48k 업샘플
+    # 24k concat → 48k
     out24 = os.path.join(work, "dubbed_24k.wav")
     concat_audio(parts, out24)
     dubbed = os.path.join(work, "dubbed.wav")
@@ -194,6 +215,7 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     meta["final_report"] = final_report
     save_meta(work, meta)
     return {"workdir": work, "dubbed_wav": dubbed, "final_report": final_report}
+
 
 
 # ----------------- ASR/번역/원샷 -----------------
@@ -209,6 +231,14 @@ async def asr_only(file: UploadFile) -> Dict:
     orig_dur = ffprobe_duration(wav_16k)
 
     segments = _whisper_transcribe(wav_16k)
+
+    # 🔹 세그먼트 간 무음(gap_after) 기록
+    for i in range(len(segments)):
+        if i < len(segments) - 1:
+            segments[i]["gap_after"] = max(0.0, float(segments[i+1]["start"]) - float(segments[i]["end"]))
+        else:
+            segments[i]["gap_after"] = 0.0
+
     meta = {
         "job_id": job_id,
         "workdir": work,
@@ -393,40 +423,71 @@ def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[L
 
 
 def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
-    """
-    STT 이후 segments를 사용자가 지정한 구간으로 병합.
-    - merges가 None이면 meta.json의 meta["merge_plan"]을 사용 (예: [[1,3],[7,8]])
-    - 결과는 meta["segments"]를 '병합된 목록'으로 교체
-    - 백업: 처음 호출 시 meta["segments_backup"]에 원본 보존
-    - 기록: meta["merge_history"]에 append
-    """
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
     if "segments" not in meta:
         raise RuntimeError("No ASR segments to merge")
 
+    src = meta["segments"]
     plan = merges if merges is not None else meta.get("merge_plan")
     if not plan:
-        # 계획이 없으면 그대로 반환
-        return {"segments": meta["segments"], "merge_map": [], "note": "no merges applied"}
+        return {"segments": src, "merge_map": [], "note": "no merges applied"}
 
-    # 튜플화
-    rngs = [(int(p[0]), int(p[1])) for p in plan]
-    merged, merge_map = _apply_merges(meta["segments"], rngs)
+    # 정규화 & 정렬
+    rngs = [(int(a), int(b)) for a,b in plan]
+    rngs.sort(key=lambda x: x[0])
+    for i in range(1, len(rngs)):
+        if rngs[i][0] <= rngs[i-1][1]:
+            raise ValueError(f"overlapping merges: {rngs[i-1]} and {rngs[i]}")
 
-    # 백업(최초 1회)
+    merged = []
+    merge_map = []
+    merge_layouts = {}  # new_index -> {"from":[...], "slots":[{start,end}], "gaps":[...]}
+    cur = 0; new_idx = 0
+
+    def append_original(k):
+        nonlocal new_idx
+        merged.append({"start": src[k]["start"], "end": src[k]["end"], "text": src[k]["text"]})
+        merge_map.append({"new_index": new_idx, "from": [k]})
+        # 단일 슬롯(머지 아님)도 레이아웃을 둬두면 일관 처리 쉬움
+        merge_layouts[new_idx] = {
+            "from": [k],
+            "slots": [{"start": src[k]["start"], "end": src[k]["end"]}],
+            "gaps":  []
+        }
+        new_idx += 1
+
+    def append_merged(a,b):
+        nonlocal new_idx
+        start = float(src[a]["start"]); end = float(src[b]["end"])
+        text = " ".join(s["text"].strip() for s in src[a:b+1] if s["text"].strip())
+        merged.append({"start": start, "end": end, "text": text})
+        merge_map.append({"new_index": new_idx, "from": list(range(a,b+1))})
+        slots = [{"start": src[k]["start"], "end": src[k]["end"]} for k in range(a,b+1)]
+        gaps  = [max(0.0, float(src[k+1]["start"]) - float(src[k]["end"])) for k in range(a, b)]
+        merge_layouts[new_idx] = {"from": list(range(a,b+1)), "slots": slots, "gaps": gaps}
+        new_idx += 1
+
+    for a,b in rngs:
+        while cur < a:
+            append_original(cur)
+            cur += 1
+        append_merged(a,b)
+        cur = b+1
+    while cur < len(src):
+        append_original(cur)
+        cur += 1
+
+    # 백업 & 기록
     if "segments_backup" not in meta:
         meta["segments_backup"] = meta["segments"]
-
     meta["segments"] = merged
-    hist = meta.get("merge_history", [])
-    hist.append({"plan": plan, "merge_map": merge_map})
-    meta["merge_history"] = hist
+    meta["merge_history"] = meta.get("merge_history", []) + [{"plan": plan, "merge_map": merge_map}]
+    meta["merge_layouts"] = merge_layouts
 
-    # 번역/프로브 산물은 무효화
-    meta.pop("translations", None)
-    meta.pop("duration_report", None)
-    meta.pop("final_report", None)
+    # 이전 산물 무효화
+    for k in ("translations","duration_report","final_report","dubbed_wav","output"):
+        meta.pop(k, None)
+
     save_meta(work, meta)
-
     return {"segments": merged, "merge_map": merge_map}
