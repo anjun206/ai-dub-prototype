@@ -255,3 +255,41 @@ def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
             bgm=shlex.quote(bgm_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
     )
+
+def mask_keep_intervals(in_wav: str, keep: list[tuple[float, float]], out_wav: str, sr: int = 48000, ac: int = 2):
+    """
+    keep 구간만 원본 레벨 그대로 두고, 그 외는 볼륨 0으로 '침묵화'하여 길이를 보존.
+    ffmpeg volume 필터의 enable를 이용해 not(keep)을 0으로 만듦.
+    """
+    dur = ffprobe_duration(in_wav)
+    if dur <= 0.0:
+        # 입력이 이상하면 동일 길이 무음
+        make_silence(out_wav, 0.0, ar=sr)
+        return
+
+    if not keep:
+        # 전부 비-스피치: 전체 길이 무음
+        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout={'stereo' if ac==2 else 'mono'}:sample_rate={sr} -t {dur:.6f} -ar {sr} -ac {ac} {shlex.quote(out_wav)}")
+        return
+
+    expr = "+".join([f"between(t,{s:.6f},{e:.6f})" for s, e in keep])
+    # keep 외 구간은 볼륨 0 → 타임라인 보존
+    run(
+        f'ffmpeg -y -i {shlex.quote(in_wav)} '
+        f'-af "volume=0:enable=\'not({expr})\'" -ar {sr} -ac {ac} {shlex.quote(out_wav)}'
+    )
+
+def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
+    """
+    (BGM + 비-스피치 FX) 를 먼저 합친 뒤, TTS로 사이드체인-컴프레션 걸고 마지막에 TTS와 섞음.
+    결과는 48k 스테레오.
+    """
+    run(
+        'ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex '
+        '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[bed];'
+        ' [bed][2:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        ' [duck][2:a]amix=inputs=2:duration=first:dropout_transition=0" '
+        '-ar 48000 -ac 2 {out}'.format(
+            bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
+        )
+    )

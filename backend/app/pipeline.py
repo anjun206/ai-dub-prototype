@@ -15,10 +15,10 @@ from .utils import (
     run, ffprobe_duration, make_silence, time_stretch,
     trim_or_pad_to_duration, concat_audio, replace_audio_in_video,
     split_audio_by_targets, separate_bgm_vocals, mix_bgm_with_tts,
-    extract_audio_full,
+    extract_audio_full,mask_keep_intervals, mix_bgm_fx_with_tts,
 )
 from .utils_meta import load_meta, save_meta
-from .vad import compute_vad_silences, sum_silence_between
+from .vad import compute_vad_silences, sum_silence_between, complement_intervals
 
 from typing import Tuple
 
@@ -36,33 +36,25 @@ EPS = 0.02  # 20ms 허용오차
 def _ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
-def _extract_audio_16k_mono(media_path: str, wav_path: str):
+def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
     """
-    - media_path: 입력 비디오/오디오 파일
-    - wav_path: 16k/mono 경로 (보이스 트랙에서 변환)
-    반환: (full_48k, vocals_48k, bgm_48k)
+    전체 오디오(48k) 추출 → 보이스/배경 분리 → 보이스 16k/mono까지 반환
+    returns: (full_48k, vocals_48k, bgm_48k, vocals_16k_raw)
     """
-    work = os.path.dirname(wav_path)
-    os.makedirs(work, exist_ok=True)
-
-    # A) 원본 오디오 48k 스테레오 추출
     full_48k = os.path.join(work, "audio_full_48k.wav")
-    extract_audio_full(media_path, full_48k)
+    extract_audio_full(in_path, full_48k)
 
-    # B) 보이스/배경 분리 (토글 가능)
     vocals_48k = os.path.join(work, "vocals_48k.wav")
     bgm_48k    = os.path.join(work, "bgm_48k.wav")
     if os.getenv("SEPARATE_BGM", "1") == "1":
         separate_bgm_vocals(full_48k, vocals_48k, bgm_48k)
     else:
-        # 분리 비사용: 보이스=원본, BGM=무음
         run(f"ffmpeg -y -i {shlex.quote(full_48k)} -ar 48000 -ac 2 {shlex.quote(vocals_48k)}")
-        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 "
-            f"-t {ffprobe_duration(full_48k):.3f} {shlex.quote(bgm_48k)}")
+        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(full_48k):.3f} {shlex.quote(bgm_48k)}")
 
-    # C) STT/VAD용 16k mono는 보이스에서 변환
-    run(f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_path)}")
-    return full_48k, vocals_48k, bgm_48k
+    vocals_16k_raw = os.path.join(work, "vocals_16k_raw.wav")
+    run(f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(vocals_16k_raw)}")
+    return full_48k, vocals_48k, bgm_48k, vocals_16k_raw
 
 
 def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
@@ -255,24 +247,48 @@ async def asr_only(file: UploadFile) -> Dict:
     with open(in_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    wav_16k = os.path.join(work, "audio_16k.wav")
-    full_48k, vocals_48k, bgm_48k = _extract_audio_16k_mono(in_path, wav_16k)  # ★ 받기
-    orig_dur = ffprobe_duration(full_48k)  # ★ 원본 길이
+    # 1) 트랙 추출
+    full_48k, vocals_48k, bgm_48k, vocals_16k_raw = _extract_tracks(in_path, work)
+    total = ffprobe_duration(full_48k)
 
-    segments = _whisper_transcribe(wav_16k)
-
-    # VAD(보이스 트랙)에 수행
+    # 2) (참고용) VAD 침묵 구간: gap 계산에만 사용
     silences = compute_vad_silences(
-        wav_16k,
+        vocals_16k_raw,
         aggressiveness=int(os.getenv("VAD_AGGR", "3")),
         frame_ms=int(os.getenv("VAD_FRAME_MS", "30")),
     )
 
+    # 3) STT는 raw 보이스(=사람말+울음 포함)에서 직접 돌리기보다,
+    #    일단 raw 보이스 16k 그대로 돌립니다. (울음 구간은 대부분 비문/공백)
+    segments = _whisper_transcribe(vocals_16k_raw)
+
+    # 4) STT 세그 기반 speech 구간(여유 margin 포함) 산출
+    margin = float(os.getenv("STT_INTERVAL_MARGIN", "0.10"))  # ±100ms
+    stt_intervals = merge_intervals([
+        (max(0.0, float(s["start"]) - margin), min(float(total), float(s["end"]) + margin))
+        for s in segments if float(s["end"]) > float(s["start"])
+    ])
+
+    # 5) 사람말 전용/FX 트랙 만들기 (타임라인 보존)
+    speech_only_48k = os.path.join(work, "speech_only_48k.wav")
+    vocals_fx_48k   = os.path.join(work, "vocals_fx_48k.wav")
+    mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
+    nonspeech_intervals = complement_intervals(stt_intervals, total)
+    mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
+
+    # 6) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
+    wav_16k = os.path.join(work, "speech_16k.wav")
+    run(f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}")
+
+    # 필요시, segments를 speech_only에서 재추출하고 싶다면 아래로 대체:
+    # segments = _whisper_transcribe(wav_16k)
+
+    # 7) gap 기록(VAD 기준; 원본 타임라인 유지)
     for i in range(len(segments)):
         if i < len(segments) - 1:
             st = float(segments[i]["end"]); en = float(segments[i+1]["start"])
             segments[i]["gap_after_vad"] = sum_silence_between(silences, st, en)
-            segments[i]["gap_after"] = max(0.0, en - st)  # (옵션) 참고값
+            segments[i]["gap_after"] = max(0.0, en - st)
         else:
             segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
@@ -281,13 +297,17 @@ async def asr_only(file: UploadFile) -> Dict:
         "job_id": job_id,
         "workdir": work,
         "input": in_path,
-        "audio_full_48k": full_48k,   # ★ 저장
-        "vocals_48k": vocals_48k,     # ★ 저장
-        "bgm_48k": bgm_48k,           # ★ 저장
-        "wav_16k": wav_16k,
-        "orig_duration": orig_dur,    # ★ 저장
+        "audio_full_48k": full_48k,
+        "vocals_48k": vocals_48k,
+        "bgm_48k": bgm_48k,
+        "speech_only_48k": speech_only_48k,   # ✅ 사람말만
+        "vocals_fx_48k":  vocals_fx_48k,      # ✅ 동물/환호 등 비-스피치
+        "wav_16k": wav_16k,                   # ✅ 이후 파이프라인 입력
+        "orig_duration": total,
         "segments": segments,
         "silences": silences,
+        "speech_intervals_stt": stt_intervals,
+        "nonspeech_intervals_stt": nonspeech_intervals,
     }
     save_meta(work, meta)
     return meta
@@ -297,10 +317,13 @@ def mux_stage(job_id: str) -> str:
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
     assert "input" in meta and "dubbed_wav" in meta
+
     out_video = os.path.join(work, "output.mp4")
-    # 1) BGM + TTS 믹스(ducking)
+
+    # 1) BGM + 비-스피치 FX + TTS 믹스(ducking)
     mix = os.path.join(work, "final_mix.wav")
-    mix_bgm_with_tts(meta["bgm_48k"], meta["dubbed_wav"], mix)
+    fx = meta.get("vocals_fx_48k", meta.get("bgm_48k"))  # 없으면 bgm로 폴백
+    mix_bgm_fx_with_tts(meta["bgm_48k"], fx, meta["dubbed_wav"], mix)
 
     # 2) 비디오와 합치기
     replace_audio_in_video(meta["input"], mix, out_video)
@@ -308,6 +331,7 @@ def mux_stage(job_id: str) -> str:
     meta["output"] = out_video
     save_meta(work, meta)
     return out_video
+
 
 
 # (선택) 원샷 dub: 번역 자동수정 없이, 최종 규칙으로 바로 처리

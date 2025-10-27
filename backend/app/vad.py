@@ -89,3 +89,50 @@ def sum_silence_between(silences: List[Tuple[float,float]], a: float, b: float) 
         if hi > lo:
             tot += (hi - lo)
     return max(0.0, tot)
+
+def complement_intervals(silences: List[Tuple[float, float]], total: float) -> List[Tuple[float, float]]:
+    """
+    [0,total]에서 silences의 여집합(=스피치 구간) 리스트를 반환.
+    """
+    if total <= 0.0:
+        return []
+    sil = sorted([(max(0.0, s), min(total, e)) for s, e in silences if e > s and e > 0], key=lambda x: x[0])
+    out = []
+    cur = 0.0
+    for s, e in sil:
+        if s > cur:
+            out.append((cur, s))
+        cur = max(cur, e)
+    if cur < total:
+        out.append((cur, total))
+    return out
+
+def merge_intervals(intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    겹치는 구간 머지. 입력은 (start,end) 리스트. end>start인 것만 사용.
+    """
+    xs = sorted([(max(0.0, a), max(0.0, b)) for a, b in intervals if b > a], key=lambda x: x[0])
+    out: List[Tuple[float, float]] = []
+    for s, e in xs:
+        if not out or s > out[-1][1] + 1e-6:
+            out.append([s, e])  # type: ignore
+        else:
+            out[-1][1] = max(out[-1][1], e)  # type: ignore
+    return [(float(a), float(b)) for a, b in out]
+
+def complement_intervals(intervals: List[Tuple[float, float]], total: float) -> List[Tuple[float, float]]:
+    """
+    [0,total] 범위에서 intervals의 여집합 반환.
+    """
+    if total <= 0.0:
+        return []
+    ints = merge_intervals([(max(0.0, a), min(total, b)) for a, b in intervals if b > a and a < total])
+    out: List[Tuple[float, float]] = []
+    cur = 0.0
+    for s, e in ints:
+        if s > cur:
+            out.append((cur, s))
+        cur = max(cur, e)
+    if cur < total:
+        out.append((cur, total))
+    return out

@@ -30,6 +30,8 @@ services:
       - ./data/hf_cache:/app/cache/hf
       - ./data/tts_cache:/app/cache/tts
       - ./data/demucs_cache:/app/cache/demucs
+      - ./backend/app:/app/app
     ports:
       - "8000:8000"
     shm_size: "2gb"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
