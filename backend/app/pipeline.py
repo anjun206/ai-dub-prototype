@@ -3,6 +3,7 @@ import os
 import uuid
 import json
 import shutil
+import shlex
 from typing import Optional, List, Dict
 
 from faster_whisper import WhisperModel
@@ -13,9 +14,11 @@ from .tts import synthesize
 from .utils import (
     run, ffprobe_duration, make_silence, time_stretch,
     trim_or_pad_to_duration, concat_audio, replace_audio_in_video,
-    split_audio_by_targets, 
+    split_audio_by_targets, separate_bgm_vocals, mix_bgm_with_tts,
+    extract_audio_full,
 )
 from .utils_meta import load_meta, save_meta
+from .vad import compute_vad_silences, sum_silence_between
 
 from typing import Tuple
 
@@ -34,7 +37,33 @@ def _ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 def _extract_audio_16k_mono(media_path: str, wav_path: str):
-    run(f"ffmpeg -y -i {media_path} -ac 1 -ar 16000 -vn -c:a pcm_s16le {wav_path}")
+    """
+    - media_path: 입력 비디오/오디오 파일
+    - wav_path: 16k/mono 경로 (보이스 트랙에서 변환)
+    반환: (full_48k, vocals_48k, bgm_48k)
+    """
+    work = os.path.dirname(wav_path)
+    os.makedirs(work, exist_ok=True)
+
+    # A) 원본 오디오 48k 스테레오 추출
+    full_48k = os.path.join(work, "audio_full_48k.wav")
+    extract_audio_full(media_path, full_48k)
+
+    # B) 보이스/배경 분리 (토글 가능)
+    vocals_48k = os.path.join(work, "vocals_48k.wav")
+    bgm_48k    = os.path.join(work, "bgm_48k.wav")
+    if os.getenv("SEPARATE_BGM", "1") == "1":
+        separate_bgm_vocals(full_48k, vocals_48k, bgm_48k)
+    else:
+        # 분리 비사용: 보이스=원본, BGM=무음
+        run(f"ffmpeg -y -i {shlex.quote(full_48k)} -ar 48000 -ac 2 {shlex.quote(vocals_48k)}")
+        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 "
+            f"-t {ffprobe_duration(full_48k):.3f} {shlex.quote(bgm_48k)}")
+
+    # C) STT/VAD용 16k mono는 보이스에서 변환
+    run(f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_path)}")
+    return full_48k, vocals_48k, bgm_48k
+
 
 def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
     # 6초 참조 (24k mono)
@@ -227,35 +256,55 @@ async def asr_only(file: UploadFile) -> Dict:
         shutil.copyfileobj(file.file, f)
 
     wav_16k = os.path.join(work, "audio_16k.wav")
-    _extract_audio_16k_mono(in_path, wav_16k)
-    orig_dur = ffprobe_duration(wav_16k)
+    full_48k, vocals_48k, bgm_48k = _extract_audio_16k_mono(in_path, wav_16k)  # ★ 받기
+    orig_dur = ffprobe_duration(full_48k)  # ★ 원본 길이
 
     segments = _whisper_transcribe(wav_16k)
 
-    # 🔹 세그먼트 간 무음(gap_after) 기록
+    # VAD(보이스 트랙)에 수행
+    silences = compute_vad_silences(
+        wav_16k,
+        aggressiveness=int(os.getenv("VAD_AGGR", "3")),
+        frame_ms=int(os.getenv("VAD_FRAME_MS", "30")),
+    )
+
     for i in range(len(segments)):
         if i < len(segments) - 1:
-            segments[i]["gap_after"] = max(0.0, float(segments[i+1]["start"]) - float(segments[i]["end"]))
+            st = float(segments[i]["end"]); en = float(segments[i+1]["start"])
+            segments[i]["gap_after_vad"] = sum_silence_between(silences, st, en)
+            segments[i]["gap_after"] = max(0.0, en - st)  # (옵션) 참고값
         else:
+            segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
 
     meta = {
         "job_id": job_id,
         "workdir": work,
         "input": in_path,
+        "audio_full_48k": full_48k,   # ★ 저장
+        "vocals_48k": vocals_48k,     # ★ 저장
+        "bgm_48k": bgm_48k,           # ★ 저장
         "wav_16k": wav_16k,
-        "orig_duration": orig_dur,
+        "orig_duration": orig_dur,    # ★ 저장
         "segments": segments,
+        "silences": silences,
     }
     save_meta(work, meta)
     return meta
+
 
 def mux_stage(job_id: str) -> str:
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
     assert "input" in meta and "dubbed_wav" in meta
     out_video = os.path.join(work, "output.mp4")
-    replace_audio_in_video(meta["input"], meta["dubbed_wav"], out_video)
+    # 1) BGM + TTS 믹스(ducking)
+    mix = os.path.join(work, "final_mix.wav")
+    mix_bgm_with_tts(meta["bgm_48k"], meta["dubbed_wav"], mix)
+
+    # 2) 비디오와 합치기
+    replace_audio_in_video(meta["input"], mix, out_video)
+    meta["final_mix"] = mix
     meta["output"] = out_video
     save_meta(work, meta)
     return out_video
@@ -266,9 +315,9 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
     job_id = str(uuid.uuid4())[:8]
     work = os.path.join("/app/data", job_id); _ensure_dir(work)
 
-    # 1) 오디오 추출
+    # 1) 오디오 추출 (+분리)
     wav_16k = os.path.join(work, "audio_16k.wav")
-    _extract_audio_16k_mono(video_in, wav_16k)
+    full_48k, vocals_48k, bgm_48k = _extract_audio_16k_mono(video_in, wav_16k)  # ★ 받기
 
     # 2) 레퍼런스
     ref_path = ref_wav or os.path.join(work, "ref.wav")
@@ -280,25 +329,21 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
     if not segments:
         raise RuntimeError("No speech detected.")
 
-    # 4) MT (자동수정 없음) → translations에 절대좌표 포함
+    # 4) MT (자동 수정 없음)
     base = translate_texts([s["text"] for s in segments], src="ko", tgt=target_lang)
     translations = [{"start": s["start"], "end": s["end"], "text": t} for s, t in zip(segments, base)]
 
-    # 5) 즉시 Finalize 규칙으로 합성/보정/결합
-    trs = translations
+    # 5) 합성/보정/결합
     parts: List[str] = []
-
-    lead = max(0.0, float(trs[0]["start"]))
+    lead = max(0.0, float(translations[0]["start"]))
     if lead > 0.0001:
         lead_wav = os.path.join(work, "lead.wav")
         make_silence(lead_wav, lead, ar=24000)
         parts.append(lead_wav)
 
     final_report: List[Dict] = []
-    for i, tr in enumerate(trs):
-        start = float(tr["start"]); end = float(tr["end"])
-        slot = max(0.05, end - start)
-
+    for i, tr in enumerate(translations):
+        start = float(tr["start"]); end = float(tr["end"]); slot = max(0.05, end - start)
         raw = os.path.join(work, f"seg_{i:04d}_raw.wav")
         synthesize(tr["text"], ref_path, language=target_lang, out_path=raw, model_name=TTS_MODEL)
         raw_dur = ffprobe_duration(raw)
@@ -317,11 +362,10 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
             final_report.append({"i": i, "mode": "pad",
                                  "raw_dur": raw_dur, "slot_dur": slot,
                                  "padded": info["padded"], "trimmed": info["trimmed"]})
-
         parts.append(fit)
 
-        if i < len(trs) - 1:
-            next_start = float(trs[i+1]["start"])
+        if i < len(translations) - 1:
+            next_start = float(translations[i+1]["start"])
             gap = max(0.0, next_start - end)
             if gap > 0.0001:
                 g = os.path.join(work, f"gap_{i:04d}.wav")
@@ -333,8 +377,12 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
     dubbed_wav = os.path.join(work, "dubbed.wav")
     run(f"ffmpeg -y -i {out24} -ar 48000 -ac 1 {dubbed_wav}")
 
+    # ★★★ BGM와 믹스 후 비디오에 입히기
+    mix = os.path.join(work, "final_mix.wav")
+    mix_bgm_with_tts(bgm_48k, dubbed_wav, mix)
+
     out_video = os.path.join(work, "output.mp4")
-    replace_audio_in_video(video_in, dubbed_wav, out_video)
+    replace_audio_in_video(video_in, mix, out_video)
 
     meta = {
         "job_id": job_id,
@@ -343,15 +391,19 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         "translations": translations,
         "workdir": work,
         "input": video_in,
+        "audio_full_48k": full_48k,  # (정보 보존)
+        "vocals_48k": vocals_48k,
+        "bgm_48k": bgm_48k,
         "wav_16k": wav_16k,
         "dubbed_wav": dubbed_wav,
+        "final_mix": mix,            # (정보 보존)
         "final_report": final_report,
         "output": out_video
     }
     with open(os.path.join(work, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-
     return meta
+
 
 def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[List[Dict], List[Dict]]:
     """
@@ -429,6 +481,7 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
         raise RuntimeError("No ASR segments to merge")
 
     src = meta["segments"]
+    all_sil = meta.get("silences", [])
     plan = merges if merges is not None else meta.get("merge_plan")
     if not plan:
         return {"segments": src, "merge_map": [], "note": "no merges applied"}
@@ -464,7 +517,14 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
         merged.append({"start": start, "end": end, "text": text})
         merge_map.append({"new_index": new_idx, "from": list(range(a,b+1))})
         slots = [{"start": src[k]["start"], "end": src[k]["end"]} for k in range(a,b+1)]
-        gaps  = [max(0.0, float(src[k+1]["start"]) - float(src[k]["end"])) for k in range(a, b)]
+        # 🔹 내부 갭: VAD 침묵 합으로 계산, 없으면 STT 차이 fallback
+        gaps  = []
+        for k in range(a, b):
+            st = float(src[k]["end"]); en = float(src[k+1]["start"])
+            vad_gap = sum_silence_between(meta.get("silences", []), st, en)
+            if vad_gap <= 0.0:
+                vad_gap = max(0.0, en - st)
+            gaps.append(vad_gap)
         merge_layouts[new_idx] = {"from": list(range(a,b+1)), "slots": slots, "gaps": gaps}
         new_idx += 1
 

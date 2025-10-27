@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional, Dict
 import re
 import tempfile
 import math
+import glob
 
 # -------------------- 공용 실행/시간 유틸 --------------------
 
@@ -211,3 +212,46 @@ def split_audio_by_targets(raw_wav: str, target_durations: list[float], out_dir:
         cut_wav_segment(raw_wav, part, s, e, ar=ar)
         outs.append(part)
     return outs
+
+def extract_audio_full(video_in: str, wav_out: str):
+    # 원본 오디오를 48k 스테레오 wav로 추출
+    run(f"ffmpeg -y -i {shlex.quote(video_in)} -map 0:a:0 -ac 2 -ar 48000 -vn -c:a pcm_s16le {shlex.quote(wav_out)}")
+
+def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str = "htdemucs"):
+    """
+    Demucs 2-stems 분리: vocals / no_vocals
+    실패하면 예외를 던지지 말고 원본을 그대로 복사하여 폴백.
+    """
+    try:
+        outdir = os.path.join(os.path.dirname(out_vocals), "sep")
+        run(f"python -m demucs.separate -n {model} --two-stems=vocals -o {shlex.quote(outdir)} {shlex.quote(in_wav)}")
+        # 결과 탐색
+        base = os.path.splitext(os.path.basename(in_wav))[0]
+        cand_dir = glob.glob(os.path.join(outdir, model, base))
+        if not cand_dir:
+            raise RuntimeError("demucs output not found")
+        cand_dir = cand_dir[0]
+        v = glob.glob(os.path.join(cand_dir, "vocals.wav"))[0]
+        nv = glob.glob(os.path.join(cand_dir, "no_vocals.wav"))[0]
+        run(f"ffmpeg -y -i {shlex.quote(v)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}")
+        run(f"ffmpeg -y -i {shlex.quote(nv)} -ar 48000 -ac 2 {shlex.quote(out_bgm)}")
+    except Exception as e:
+        print("WARN: demucs separation failed, fallback to original mix:", e)
+        # 폴백: 보이스=원본, bgm=무음
+        run(f"ffmpeg -y -i {shlex.quote(in_wav)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}")
+        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(in_wav):.3f} {shlex.quote(out_bgm)}")
+
+def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
+    """
+    BGM을 TTS에 사이드체인 컴프레션으로 살짝 눌러 섞기.
+    - 최종 출력: 48k 스테레오
+    """
+    # tts가 모노라도 amix가 알아서 섞습니다.
+    run(
+        'ffmpeg -y -i {bgm} -i {tts} -filter_complex '
+        '"[0:a][1:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        ' [duck][1:a]amix=inputs=2:duration=first:dropout_transition=0" '
+        '-ar 48000 -ac 2 {out}'.format(
+            bgm=shlex.quote(bgm_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
+        )
+    )

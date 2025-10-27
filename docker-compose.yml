@@ -6,6 +6,7 @@ services:
     container_name: ai-dub
     gpus: all
     environment:
+      SEPARATE_BGM: "1"
       USE_GPU: "1"
       TTS_DEVICE: "cuda"
       MT_DEVICE: "cuda"       # ✅ 번역도 GPU
@@ -14,6 +15,7 @@ services:
       HF_HOME: /app/cache/hf
       TRANSFORMERS_CACHE: /app/cache/hf
       HUGGINGFACE_HUB_CACHE: /app/cache/hf
+      DEMUCS_CACHE: /app/cache/demucs
       TTS_HOME: /app/cache/tts
       WHISPER_BACKEND: whisperx   # <- 코드상 실제 사용은 faster_whisper이므로 참고값
       WHISPER_MODEL: large-v3
@@ -27,6 +29,7 @@ services:
       - ./data:/app/data
       - ./data/hf_cache:/app/cache/hf
       - ./data/tts_cache:/app/cache/tts
+      - ./data/demucs_cache:/app/cache/demucs
     ports:
       - "8000:8000"
     shm_size: "2gb"
