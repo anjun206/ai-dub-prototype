@@ -16,6 +16,8 @@ from .utils import (
 )
 from .utils_meta import load_meta, save_meta
 
+from typing import Tuple
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # base|small|medium|large-v3
 TTS_MODEL = os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
 
@@ -320,3 +322,111 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     return meta
+
+def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    merges: [(start_idx, end_idx), ...] 0-based, inclusive, 오름차순/비겹침/연속 범위만 허용
+    반환: (merged_segments, merge_map)
+      - merged_segments: [{"start":..,"end":..,"text":..}, ...]
+      - merge_map: [{"new_index": k, "from": [i..j]} ...]
+    """
+    n = len(segments)
+    if n == 0:
+        return [], []
+
+    # 정규화 & 검증
+    norm = []
+    for s, e in merges or []:
+        s, e = int(s), int(e)
+        if not (0 <= s <= e < n):
+            raise ValueError(f"merge range out of bounds: ({s},{e}) with n={n}")
+        norm.append((s, e))
+    norm.sort(key=lambda x: x[0])
+
+    # 겹치거나 역순/중첩 금지, 반드시 오름차순 비중첩
+    for i in range(1, len(norm)):
+        prev = norm[i-1]; cur = norm[i]
+        if cur[0] <= prev[1]:
+            raise ValueError(f"overlapping merges: {prev} and {cur}")
+
+    merged = []
+    mapping = []
+    cur_i = 0
+    new_idx = 0
+
+    def _append_original(idx):
+        nonlocal new_idx
+        merged.append({
+            "start": float(segments[idx]["start"]),
+            "end": float(segments[idx]["end"]),
+            "text": segments[idx]["text"],
+        })
+        mapping.append({"new_index": new_idx, "from": [idx]})
+        new_idx += 1
+
+    def _append_merged(a, b):
+        nonlocal new_idx
+        start = float(segments[a]["start"])
+        end   = float(segments[b]["end"])
+        # 텍스트는 공백 하나로 연결
+        text = " ".join(segments[k]["text"].strip() for k in range(a, b+1) if segments[k]["text"].strip())
+        merged.append({"start": start, "end": end, "text": text})
+        mapping.append({"new_index": new_idx, "from": list(range(a, b+1))})
+        new_idx += 1
+
+    for rng in norm:
+        a, b = rng
+        # 병합 구간 전의 원본 세그먼트들 추가
+        while cur_i < a:
+            _append_original(cur_i)
+            cur_i += 1
+        # 병합 구간 추가
+        _append_merged(a, b)
+        cur_i = b + 1
+
+    # 남은 꼬리 구간 추가
+    while cur_i < n:
+        _append_original(cur_i)
+        cur_i += 1
+
+    return merged, mapping
+
+
+def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
+    """
+    STT 이후 segments를 사용자가 지정한 구간으로 병합.
+    - merges가 None이면 meta.json의 meta["merge_plan"]을 사용 (예: [[1,3],[7,8]])
+    - 결과는 meta["segments"]를 '병합된 목록'으로 교체
+    - 백업: 처음 호출 시 meta["segments_backup"]에 원본 보존
+    - 기록: meta["merge_history"]에 append
+    """
+    work = os.path.join("/app/data", job_id)
+    meta = load_meta(work)
+    if "segments" not in meta:
+        raise RuntimeError("No ASR segments to merge")
+
+    plan = merges if merges is not None else meta.get("merge_plan")
+    if not plan:
+        # 계획이 없으면 그대로 반환
+        return {"segments": meta["segments"], "merge_map": [], "note": "no merges applied"}
+
+    # 튜플화
+    rngs = [(int(p[0]), int(p[1])) for p in plan]
+    merged, merge_map = _apply_merges(meta["segments"], rngs)
+
+    # 백업(최초 1회)
+    if "segments_backup" not in meta:
+        meta["segments_backup"] = meta["segments"]
+
+    meta["segments"] = merged
+    hist = meta.get("merge_history", [])
+    hist.append({"plan": plan, "merge_map": merge_map})
+    meta["merge_history"] = hist
+
+    # 번역/프로브 산물은 무효화
+    meta.pop("translations", None)
+    meta.pop("duration_report", None)
+    meta.pop("final_report", None)
+    save_meta(work, meta)
+
+    return {"segments": merged, "merge_map": merge_map}

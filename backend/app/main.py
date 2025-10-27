@@ -33,11 +33,10 @@ app.add_middleware(
 from .pipeline import (
     dub, asr_only, translate_stage,
     tts_probe_stage, tts_finalize_stage,
-    mux_stage
+    mux_stage, merge_segments_stage
 )
 from .utils_meta import load_meta, save_meta
 import shutil
-import os
 
 # ---------- 바디 모델 (PATCH는 사용 안 해도 OK) ----------
 class SegmentPatch(BaseModel):
@@ -51,6 +50,12 @@ class TranslateBody(BaseModel):
     src: str
     tgt: str
     length_mode: Optional[str] = Field(default="off", description="'off' only (no auto-edit)")
+
+class MergeBody(BaseModel):
+    merges: Optional[list[list[int]]] = Field(
+        default=None,
+        description="0-based inclusive ranges, e.g., [[1,3],[7,8]]"
+    )
 
 class TranslationPatch(BaseModel):
     i: int
@@ -198,3 +203,11 @@ async def tts_compat_endpoint(
 def mux_endpoint(job_id: str):
     path = mux_stage(job_id)
     return {"ok": True, "output": path}
+
+
+# 6) 병합
+@app.post("/merge/{job_id}")
+def merge_endpoint(job_id: str, body: Optional[MergeBody] = None):
+    merges = body.merges if body and body.merges else None
+    out = merge_segments_stage(job_id, merges=merges)
+    return {"ok": True, **out}
