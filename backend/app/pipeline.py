@@ -16,6 +16,7 @@ from .utils import (
     trim_or_pad_to_duration, concat_audio, replace_audio_in_video,
     split_audio_by_targets, separate_bgm_vocals, mix_bgm_with_tts,
     extract_audio_full,mask_keep_intervals, mix_bgm_fx_with_tts,
+    cut_wav_segment,
 )
 from .utils_meta import load_meta, save_meta
 from .vad import compute_vad_silences, sum_silence_between, complement_intervals, merge_intervals
@@ -608,3 +609,47 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
 
     save_meta(work, meta)
     return {"segments": merged, "merge_map": merge_map}
+
+
+# ----------------- Voice Sample: 무음 제거 후 음성만 연결 -----------------
+def build_voice_sample_stage(job_id: str, out_sr: int = 24000):
+    """
+    ASR 세그먼트 기준으로 스피치 구간만 잘라 순차적으로 연결한 WAV 생성.
+    - 입력: /asr 단계가 완료된 job_id가 있어야 함 (segments, speech_only_48k 필요)
+    - 출력: voice_sample_24k.wav (기본)
+
+    반환: {"workdir": str, "voice_sample_wav": str, "parts": [str]}
+    """
+    work = os.path.join("/app/data", job_id)
+    meta = load_meta(work)
+    if "segments" not in meta:
+        raise RuntimeError("No ASR segments for this job")
+
+    # 스피치만 남긴 48k 트랙 (타임라인 보존됨)
+    src_wav = meta.get("speech_only_48k") or meta.get("vocals_48k")
+    if not src_wav or not os.path.exists(src_wav):
+        # 폴백: 전체 오디오에서 잘라내기
+        src_wav = meta.get("audio_full_48k")
+    if not src_wav or not os.path.exists(src_wav):
+        raise RuntimeError("No source wav to cut from")
+
+    segs: List[Dict] = meta["segments"]
+    parts: List[str] = []
+    for i, s in enumerate(segs):
+        st = float(s.get("start", 0.0)); en = float(s.get("end", 0.0))
+        if en <= st + 1e-3:
+            continue
+        part = os.path.join(work, f"sample_part_{i:04d}.wav")
+        # 24k/mono로 컷하여 저장
+        cut_wav_segment(src_wav, part, st, en, ar=out_sr)
+        parts.append(part)
+
+    if not parts:
+        raise RuntimeError("No non-empty segments to build sample")
+
+    out24 = os.path.join(work, "voice_sample_24k.wav" if out_sr == 24000 else f"voice_sample_{out_sr//1000}k.wav")
+    concat_audio(parts, out24)
+
+    meta["voice_sample_wav"] = out24
+    save_meta(work, meta)
+    return {"workdir": work, "voice_sample_wav": out24, "parts": parts}

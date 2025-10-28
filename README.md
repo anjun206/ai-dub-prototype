@@ -16,6 +16,18 @@ docker compose up
 
 서버: http://localhost:8000/docs
 
+## 🔊 Voice Sample (무음 제거 음성 추출)
+- Swagger에서 `POST /voice-sample` 엔드포인트로 `.mp4/.wav` 업로드
+- 처리: BGM/잡음 분리 → STT 세그먼트로 무음 구간 제거 → 음성만 연결한 WAV 반환
+- 생성물은 `./data/<job_id>/voice_sample_24k.wav` 에도 저장됩니다.
+
+예시 (PowerShell):
+```powershell
+Invoke-WebRequest -Uri http://localhost:8000/voice-sample -Method Post -Form @{
+  file = Get-Item .\sample.mp4
+} -OutFile voice_sample.wav
+```
+
 ## 🧪 사용 예시 (PowerShell)
 ```powershell
 # 영어 더빙

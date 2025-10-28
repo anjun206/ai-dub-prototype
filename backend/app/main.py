@@ -33,7 +33,8 @@ app.add_middleware(
 from .pipeline import (
     dub, asr_only, translate_stage,
     tts_probe_stage, tts_finalize_stage,
-    mux_stage, merge_segments_stage
+    mux_stage, merge_segments_stage,
+    build_voice_sample_stage,
 )
 from .utils_meta import load_meta, save_meta
 import shutil
@@ -211,3 +212,27 @@ def merge_endpoint(job_id: str, body: Optional[MergeBody] = None):
     merges = body.merges if body and body.merges else None
     out = merge_segments_stage(job_id, merges=merges)
     return {"ok": True, **out}
+
+
+# 7) Voice Sample (무음 제거하여 음성만 연결)
+@app.post("/voice-sample")
+async def voice_sample_endpoint(
+    file: UploadFile = File(..., description="Video or audio file (.mp4, .wav, etc.)"),
+):
+    """
+    업로드한 파일에서 배경/잡음 분리 → STT 세그먼트 기반으로 무음 구간 제거 → 음성만 연결한 WAV 반환.
+    """
+    meta = await asr_only(file)
+    job_id = meta["job_id"]
+    out = build_voice_sample_stage(job_id)
+    return FileResponse(out["voice_sample_wav"], media_type="audio/wav", filename=f"voice_sample_{job_id}.wav")
+
+
+@app.get("/voice-sample/{job_id}")
+def voice_sample_download(job_id: str):
+    work = f"/app/data/{job_id}"
+    meta = load_meta(work)
+    path = meta.get("voice_sample_wav")
+    if not path or not os.path.exists(path):
+        return JSONResponse({"error": "Voice sample not found for this job"}, status_code=404)
+    return FileResponse(path, media_type="audio/wav", filename=f"voice_sample_{job_id}.wav")
