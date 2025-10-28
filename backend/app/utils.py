@@ -295,3 +295,20 @@ def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
             bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
     )
+
+def subtract_intervals(A, B):
+    # A에서 B를 뺀다. 입력은 (start,end) 정렬·머지된 상태가 이상적.
+    out = []
+    for (s,e) in A:
+        cur = s
+        for (bs,be) in B:
+            if be <= cur or bs >= e: 
+                continue
+            if bs > cur: 
+                out.append((cur, bs))
+            cur = max(cur, be)
+            if cur >= e: 
+                break
+        if cur < e:
+            out.append((cur, e))
+    return merge_intervals(out)

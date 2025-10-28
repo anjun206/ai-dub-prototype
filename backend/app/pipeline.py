@@ -19,8 +19,14 @@ from .utils import (
     cut_wav_segment,
 )
 from .utils_meta import load_meta, save_meta
-from .vad import compute_vad_silences, sum_silence_between, complement_intervals, merge_intervals
-
+from .animal import detect_animal_intervals
+from .vad import (
+    compute_vad_silences,
+    sum_silence_between,
+    complement_intervals,
+    merge_intervals,
+)
+from .utils import subtract_intervals
 from typing import Tuple
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # base|small|medium|large-v3
@@ -285,39 +291,55 @@ async def asr_only(file: UploadFile) -> Dict:
     full_48k, vocals_48k, bgm_48k, vocals_16k_raw = _extract_tracks(in_path, work)
     total = ffprobe_duration(full_48k)
 
-    # 2) (참고용) VAD 침묵 구간: gap 계산에만 사용
+    # 2) (참고용) VAD 침묵 구간
     silences = compute_vad_silences(
         vocals_16k_raw,
         aggressiveness=int(os.getenv("VAD_AGGR", "3")),
         frame_ms=int(os.getenv("VAD_FRAME_MS", "30")),
     )
 
-    # 3) STT는 raw 보이스(=사람말+울음 포함)에서 직접 돌리기보다,
-    #    일단 raw 보이스 16k 그대로 돌립니다. (울음 구간은 대부분 비문/공백)
+    # 3) STT (raw 보이스 16k에서 직접)
     segments = _whisper_transcribe(vocals_16k_raw)
 
-    # 4) STT 세그 기반 speech 구간(여유 margin 포함) 산출
+    # 4) STT 세그 기반 speech 구간(±margin)
     margin = float(os.getenv("STT_INTERVAL_MARGIN", "0.10"))  # ±100ms
     stt_intervals = merge_intervals([
         (max(0.0, float(s["start"]) - margin), min(float(total), float(s["end"]) + margin))
         for s in segments if float(s["end"]) > float(s["start"])
     ])
 
-    # 5) 사람말 전용/FX 트랙 만들기 (타임라인 보존)
+    # 5) 동물 구간 검출 (PANNs 기반; 2번에서 만든 detect_animal_intervals 사용)
+    #    입력은 16k이지만 함수 내부에서 32k로 로드/리샘플 처리함.
+    animal_intervals = detect_animal_intervals(vocals_16k_raw)
+
+    # 6) 사람말에서 동물 구간을 빼서 '정제된 말(speech_clean)' 산출
+    speech_clean = subtract_intervals(stt_intervals, animal_intervals)
+
+    # 7) 타임라인 보존 마스킹 트랙 생성
+    #    - 사람말만: speech_only_48k
+    #    - 동물 전용: animal_fx_48k  (디버깅/가중치 조절용으로도 유용)
+    #    - 비-스피치(= 말 제외 전부): vocals_fx_48k  ← 최종 믹스에서 FX로 사용
     speech_only_48k = os.path.join(work, "speech_only_48k.wav")
+    mask_keep_intervals(vocals_48k, speech_clean, speech_only_48k, sr=48000, ac=2)
+
+    animal_fx_48k = os.path.join(work, "animal_fx_48k.wav")
+    if animal_intervals:
+        mask_keep_intervals(vocals_48k, animal_intervals, animal_fx_48k, sr=48000, ac=2)
+    else:
+        # 동물 구간이 없으면 빈(무음) 트랙 생성
+        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {total:.3f} -ar 48000 -ac 2 {shlex.quote(animal_fx_48k)}")
+
+    nonspeech_intervals = complement_intervals(speech_clean, total)
     vocals_fx_48k   = os.path.join(work, "vocals_fx_48k.wav")
-    mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
-    nonspeech_intervals = complement_intervals(stt_intervals, total)
     mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
 
-    # 6) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
+    # 8) STT/후속 처리는 "사람말만" 트랙 기준 (타임라인 동일)
     wav_16k = os.path.join(work, "speech_16k.wav")
     run(f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}")
-
-    # 필요시, segments를 speech_only에서 재추출하고 싶다면 아래로 대체:
+    # 필요시: segments를 speech_only에서 재추출하려면 아래를 사용
     # segments = _whisper_transcribe(wav_16k)
 
-    # 7) gap 기록(VAD 기준; 원본 타임라인 유지)
+    # 9) gap 기록(VAD 기준; 원본 타임라인 유지)
     for i in range(len(segments)):
         if i < len(segments) - 1:
             st = float(segments[i]["end"]); en = float(segments[i+1]["start"])
@@ -334,13 +356,20 @@ async def asr_only(file: UploadFile) -> Dict:
         "audio_full_48k": full_48k,
         "vocals_48k": vocals_48k,
         "bgm_48k": bgm_48k,
+
+        # 새롭게 정의된 트랙들
         "speech_only_48k": speech_only_48k,   # ✅ 사람말만
-        "vocals_fx_48k":  vocals_fx_48k,      # ✅ 동물/환호 등 비-스피치
+        "animal_fx_48k":  animal_fx_48k,      # ✅ 동물 울음 전용 (옵션)
+        "vocals_fx_48k":  vocals_fx_48k,      # ✅ 비-스피치(동물 포함) FX
+
         "wav_16k": wav_16k,                   # ✅ 이후 파이프라인 입력
         "orig_duration": total,
         "segments": segments,
         "silences": silences,
-        "speech_intervals_stt": stt_intervals,
+
+        # 인터벌 기록 (정제 전/후)
+        "speech_intervals_stt": speech_clean,         # ← 정제된 말 구간(동물 제외)
+        "animal_intervals": animal_intervals,
         "nonspeech_intervals_stt": nonspeech_intervals,
     }
     save_meta(work, meta)
