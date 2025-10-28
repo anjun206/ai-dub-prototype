@@ -286,9 +286,11 @@ def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
     """
     run(
         'ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex '
-        '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[bed];'
-        ' [bed][2:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
-        ' [duck][2:a]amix=inputs=2:duration=first:dropout_transition=0" '
+        '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,'
+        'aformat=channel_layouts=stereo[bed];'
+        ' [2:a]pan=stereo|c0=c0|c1=c0,asplit=2[tts_sc][tts_mix];'
+        ' [bed][tts_sc]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        ' [duck][tts_mix]amix=inputs=2:duration=first:dropout_transition=0" '
         '-ar 48000 -ac 2 {out}'.format(
             bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )

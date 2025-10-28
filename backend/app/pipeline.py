@@ -18,7 +18,7 @@ from .utils import (
     extract_audio_full,mask_keep_intervals, mix_bgm_fx_with_tts,
 )
 from .utils_meta import load_meta, save_meta
-from .vad import compute_vad_silences, sum_silence_between, complement_intervals
+from .vad import compute_vad_silences, sum_silence_between, complement_intervals, merge_intervals
 
 from typing import Tuple
 
@@ -98,7 +98,7 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
     slot(=end-start)과 비교해 over/less/fit 및 초 차이(delta)를 기록.
     오디오는 결합하지 않음. 리포트만 저장/반환.
     """
-    assert target_lang in ("en", "ja")
+    assert target_lang in ("en", "ja", "ko")
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
     assert "translations" in meta, "No translations"
@@ -141,7 +141,7 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
 
 # ----------------- 2차 TTS: 최종 보정/결합(Finalize) -----------------
 async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[UploadFile]):
-    assert target_lang in ("en", "ja")
+    assert target_lang in ("en", "ja", "ko")
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
     assert "translations" in meta and "wav_16k" in meta and "input" in meta

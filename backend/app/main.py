@@ -78,7 +78,7 @@ async def dub_endpoint(
     target_lang: str = Form(..., description="'en' or 'ja'"),
     ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)"),
 ):
-    assert target_lang in ("en", "ja"), "target_lang must be 'en' or 'ja'"
+    assert target_lang in ("en", "ja", "ko"), "target_lang must be 'en' or 'ja' or 'ko'"
     tmp_dir = "/app/data/tmp"
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -172,7 +172,7 @@ def patch_translations(job_id: str, body: TranslationsPatch):
 @app.post("/tts-probe/{job_id}")
 async def tts_probe_endpoint(
     job_id: str,
-    target_lang: str = Form(..., description="'en' or 'ja'"),
+    target_lang: str = Form(..., description="'en' or 'ja' or 'ko'"),
     ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)")
 ):
     out = await tts_probe_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)
@@ -182,7 +182,7 @@ async def tts_probe_endpoint(
 @app.post("/tts-finalize/{job_id}")
 async def tts_finalize_endpoint(
     job_id: str,
-    target_lang: str = Form(..., description="'en' or 'ja'"),
+    target_lang: str = Form(..., description="'en' or 'ja' or 'ko'"),
     ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)")
 ):
     out = await tts_finalize_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)
@@ -192,7 +192,7 @@ async def tts_finalize_endpoint(
 @app.post("/tts/{job_id}")
 async def tts_compat_endpoint(
     job_id: str,
-    target_lang: str = Form(..., description="'en' or 'ja'"),
+    target_lang: str = Form(..., description="'en' or 'ja' or 'ko'"),
     ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)")
 ):
     out = await tts_finalize_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)

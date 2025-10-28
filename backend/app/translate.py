@@ -3,7 +3,7 @@ import os
 from functools import lru_cache
 
 import torch
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 
 # ---------------------------
 # Device / auth 설정
@@ -24,8 +24,6 @@ _HF_TOKEN = (
 _PIPE_KW = {}
 if _DEVICE_INDEX >= 0:
     _PIPE_KW["device"] = _DEVICE_INDEX
-    if _USE_GPU:
-        _PIPE_KW["torch_dtype"] = torch.float16  # 작은 마리안 모델엔 반정밀도 OK
 
 if _HF_TOKEN:
     _PIPE_KW["token"] = _HF_TOKEN
@@ -39,6 +37,7 @@ MODEL_PREFS = {
     ("en", "ko"): [
         "Helsinki-NLP/opus-mt-en-ko",
         "Helsinki-NLP/opus-mt-tc-big-en-ko",  # 대체
+        "facebook/m2m100_418M",
     ],
     ("ja", "en"): ["Helsinki-NLP/opus-mt-ja-en", "Helsinki-NLP/opus-mt-jap-en"],
     ("en", "ja"): ["Helsinki-NLP/opus-mt-en-jap"],
@@ -70,9 +69,14 @@ def _get_mt(model_name: str, token_key: int = 1):
         raise
 
 def _run_pipe(mt, texts):
-    # transformers의 translation pipeline 호출
-    # 긴 텍스트도 문장 리스트로 넣는 현재 구조에선 기본값으로 충분
-    outs = mt(texts, max_length=512)
+    # 번역은 확정적 추론: 샘플링 금지, 빔검색 안정화
+    outs = mt(
+        texts,
+        max_length=512,
+        do_sample=False,
+        num_beams=4,
+        clean_up_tokenization_spaces=True,
+    )
     return [o["translation_text"] for o in outs]
 
 # ---------------------------
@@ -145,7 +149,10 @@ def translate_texts(texts, src: str, tgt: str):
         last_err = None
         for m in models:
             try:
-                return _run_pipe(_get_mt(m), texts)
+                out = _run_pipe(_get_mt(m), texts)
+                if (src, tgt) == ("en", "ko") and any(_looks_garbled_ko(x) for x in out):
+                        return _run_m2m100(texts, "en", "ko")
+                return out
             except Exception as e:
                 last_err = e
                 continue
@@ -165,3 +172,26 @@ def translate_texts(texts, src: str, tgt: str):
 
     # 2) no direct mapping → 2-hop(en)
     return _two_hop(texts, src, "en", tgt)
+
+def _looks_garbled_ko(s: str) -> bool:
+    # 한글 비율이 매우 낮고, 일본어 구두점/난수토큰이 섞였으면 가비지로 판단
+    if not s: return True
+    ja_punct = ("、", "。", "・")
+    bad_hit = any(p in s for p in ja_punct)
+    hangul = sum(0xAC00 <= ord(ch) <= 0xD7A3 for ch in s)
+    latin  = sum(('A' <= ch <= 'Z') or ('a' <= ch <= 'z') for ch in s)
+    digits = sum(ch.isdigit() for ch in s)
+    total  = len(s)
+    return bad_hit or (hangul/ max(1,total) < 0.15 and (latin+digits)/max(1,total) > 0.6)
+
+def _run_m2m100(texts, src: str, tgt: str):
+    name = "facebook/m2m100_418M"
+    tok = AutoTokenizer.from_pretrained(name)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(name)
+    # 언어 코드 지정
+    tok.src_lang = src if len(src) == 2 else "en"
+    t = tok(texts, return_tensors="pt", padding=True, truncation=True)
+    gen = mdl.generate(**t, forced_bos_token_id=tok.get_lang_id(tgt if len(tgt)==2 else "ko"),
+                       max_length=512, num_beams=4)
+    outs = tok.batch_decode(gen, skip_special_tokens=True)
+    return outs
