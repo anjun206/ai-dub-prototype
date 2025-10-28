@@ -153,14 +153,28 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     parts: List[str] = []
     final_report: List[Dict] = []
 
+    # 🔹 각 세그먼트의 '오른쪽 절대 갭' 미리 계산
+    right_gaps: List[float] = []
+    for i in range(len(trs)):
+        if i < len(trs) - 1:
+            rg = max(0.0, float(trs[i+1]["start"]) - float(trs[i]["end"]))
+        else:
+            rg = 0.0
+        right_gaps.append(rg)
+
     # 리딩 갭
     lead = max(0.0, float(trs[0]["start"]))
     if lead > 0.0001:
-        lead_wav = os.path.join(work, "lead.wav"); make_silence(lead_wav, lead, ar=24000); parts.append(lead_wav)
+        lead_wav = os.path.join(work, "lead.wav")
+        make_silence(lead_wav, lead, ar=24000)
+        parts.append(lead_wav)
 
     for i, tr in enumerate(trs):
         start = float(tr["start"]); end = float(tr["end"])
         slot = max(0.05, end - start)
+
+        # 외부 갭(세그 i와 i+1 사이)에 실제로 삽입할 길이(빌림 적용 후)
+        post_gap: Optional[float] = None
 
         # 이 번역 세그가 머지된 것인지 확인
         lay = layout.get(i)
@@ -182,12 +196,14 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
                     tmp = outp.replace(".wav", "_tempo.wav")
                     time_stretch(ch, tmp, tempo=tempo, ar=24000)
                     info = trim_or_pad_to_duration(tmp, outp, tgt, ar=24000)
-                    final_report.append({"i": i, "sub": j, "mode": "speedup", "tempo": tempo,
-                                         "raw_dur": ch_dur, "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
+                    final_report.append({"i": i, "sub": j, "mode": "speedup",
+                                         "tempo": tempo, "raw_dur": ch_dur,
+                                         "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
                 else:
                     info = trim_or_pad_to_duration(ch, outp, tgt, ar=24000)
                     final_report.append({"i": i, "sub": j, "mode": "pad",
-                                         "raw_dur": ch_dur, "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
+                                         "raw_dur": ch_dur, "slot_dur": tgt,
+                                         "padded": info["padded"], "trimmed": info["trimmed"]})
                 parts.append(outp)
 
                 # 내부 갭 삽입
@@ -197,30 +213,48 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
                         g = os.path.join(work, f"final_{i:04d}_gap_{j:02d}.wav")
                         make_silence(g, gap, ar=24000)
                         parts.append(g)
+
+            # 머지 케이스는 외부 갭을 빌리지 않고 기본값 사용
+            if i < len(trs) - 1:
+                post_gap = right_gaps[i]
+
         else:
-            # 🔸 일반(머지 아님 or 단일 슬롯) 처리: 기존 규칙
+            # 🔸 일반(머지 아님 or 단일 슬롯) 처리: 오른쪽 갭에서 시간 '빌려' slot 확대
             raw = os.path.join(work, f"final_{i:04d}_raw.wav")
             synthesize(tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL)
             raw_dur = ffprobe_duration(raw)
 
+            need   = max(0.0, raw_dur - slot)         # 모자란 시간
+            borrow = min(need, right_gaps[i])          # 오른쪽 갭에서 빌릴 수 있는 만큼
+            slot_used = slot + borrow                  # 실사용 슬롯
+            gap_after = max(0.0, right_gaps[i] - borrow)  # 남겨둘 외부 갭
+            post_gap = gap_after
+
             fit = os.path.join(work, f"final_{i:04d}_slot.wav")
-            if raw_dur > slot + EPS:
-                tempo = raw_dur / slot
+            if raw_dur > slot_used + EPS:
+                tempo = raw_dur / slot_used
                 tmp = fit.replace(".wav", "_tempo.wav")
                 time_stretch(raw, tmp, tempo=tempo, ar=24000)
-                info = trim_or_pad_to_duration(tmp, fit, slot, ar=24000)
-                final_report.append({"i": i, "mode": "speedup", "tempo": tempo,
-                                     "raw_dur": raw_dur, "slot_dur": slot, "padded": info["padded"], "trimmed": info["trimmed"]})
+                info = trim_or_pad_to_duration(tmp, fit, slot_used, ar=24000)
+                final_report.append({
+                    "i": i, "mode": "speedup+borrow", "tempo": tempo,
+                    "borrowed": borrow, "raw_dur": raw_dur,
+                    "slot": slot, "slot_used": slot_used,
+                    "padded": info["padded"], "trimmed": info["trimmed"]
+                })
             else:
-                info = trim_or_pad_to_duration(raw, fit, slot, ar=24000)
-                final_report.append({"i": i, "mode": "pad",
-                                     "raw_dur": raw_dur, "slot_dur": slot, "padded": info["padded"], "trimmed": info["trimmed"]})
+                info = trim_or_pad_to_duration(raw, fit, slot_used, ar=24000)
+                final_report.append({
+                    "i": i, "mode": "pad/fit+borrow",
+                    "borrowed": borrow, "raw_dur": raw_dur,
+                    "slot": slot, "slot_used": slot_used,
+                    "padded": info["padded"], "trimmed": info["trimmed"]
+                })
             parts.append(fit)
 
-        # 번역 세그 간 외부 절대 갭
+        # 🔹 외부(세그 간) 절대 갭 삽입: 빌림 반영한 post_gap 사용
         if i < len(trs) - 1:
-            next_start = float(trs[i+1]["start"])
-            gap = max(0.0, next_start - end)
+            gap = float(post_gap if post_gap is not None else right_gaps[i])
             if gap > 0.0001:
                 g = os.path.join(work, f"gap_{i:04d}.wav")
                 make_silence(g, gap, ar=24000)
@@ -236,7 +270,6 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     meta["final_report"] = final_report
     save_meta(work, meta)
     return {"workdir": work, "dubbed_wav": dubbed, "final_report": final_report}
-
 
 
 # ----------------- ASR/번역/원샷 -----------------

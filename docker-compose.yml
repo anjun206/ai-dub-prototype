@@ -10,6 +10,11 @@ services:
       USE_GPU: "1"
       TTS_DEVICE: "cuda"
       MT_DEVICE: "cuda"       # ✅ 번역도 GPU
+      MT_FAST_ONLY: "1"          # 1=빠른 모델만, 0=무거운 백업까지 허용
+      MT_NUM_BEAMS: "1"          # 1(추천). 품질↑ 원하면 2~3
+      MT_MAX_NEW_TOKENS: "96"    # 문장 길면 128~160
+      MT_MAX_BATCH_TOKENS: "2048"
+      MT_MAX_BATCH_SIZE: "16"
       MT_FP16: "1"            # ✅ (선택) fp16 시도
       COQUI_TOS_AGREED: "1"
       HF_HOME: /app/cache/hf
