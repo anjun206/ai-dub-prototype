@@ -634,6 +634,8 @@ def build_voice_sample_stage(job_id: str, out_sr: int = 24000):
         raise RuntimeError("No source wav to cut from")
 
     segs: List[Dict] = meta["segments"]
+    min_gap = float(os.getenv("VOICE_SAMPLE_MIN_GAP", "0.2"))
+    max_gap = float(os.getenv("VOICE_SAMPLE_MAX_GAP", "1.5"))
     parts: List[str] = []
     for i, s in enumerate(segs):
         st = float(s.get("start", 0.0)); en = float(s.get("end", 0.0))
@@ -643,6 +645,14 @@ def build_voice_sample_stage(job_id: str, out_sr: int = 24000):
         # 24k/mono로 컷하여 저장
         cut_wav_segment(src_wav, part, st, en, ar=out_sr)
         parts.append(part)
+
+        if i < len(segs) - 1:
+            raw_gap = float(s.get("gap_after_vad") or s.get("gap_after") or 0.0)
+            gap_sec = min(max(raw_gap, min_gap), max_gap) if raw_gap > 0 else min_gap
+            if gap_sec > 1e-3:
+                gap_wav = os.path.join(work, f"sample_gap_{i:04d}.wav")
+                make_silence(gap_wav, gap_sec, ar=out_sr)
+                parts.append(gap_wav)
 
     if not parts:
         raise RuntimeError("No non-empty segments to build sample")
