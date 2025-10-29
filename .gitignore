@@ -12,7 +12,7 @@
 !/backend/
 
 # 3) backend 내부는 기본 무시
-/backend/*
+!/backend/*
 
 # 4) 단, app만 추적
 !/backend/app/
