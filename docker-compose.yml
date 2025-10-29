@@ -27,7 +27,10 @@ services:
       WHISPER_BATCH_SIZE: "8"
       WHISPERX_ALIGN: "1"
       WHISPER_LANG: ko
-      TTS_MODEL: "tts_models/multilingual/multi-dataset/xtts_v2"
+      TTS_MODEL: "openvoice_v2"
+      OPENVOICE_V2_DIR: "/app/assets/openvoice_v2/checkpoints_v2"
+      OPENVOICE_SPEAKER: "default"  # friendly/cheerful/excited/sad/angry/terrified/shouting/whispering
+      OPENVOICE_SPEED: "1.0"        # 0.9~1.1 정도로 미세 조절
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     volumes:

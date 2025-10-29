@@ -1,42 +1,55 @@
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_PREFER_BINARY=1
 
-# 필수 패키지
+# 시스템 패키지 + FFmpeg dev (PyAV 소스빌드 필요시 대비)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
+    python3 python3-venv python3-pip python3-dev \
     build-essential git git-lfs curl ca-certificates \
     ffmpeg sox libsndfile1 libsndfile1-dev \
     libgl1 libglib2.0-0 \
     ninja-build cmake pkg-config \
-    wget \
-&& rm -rf /var/lib/apt/lists/*
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libswscale-dev libswresample-dev libavfilter-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
+ && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1 \
+ && python -m pip install --upgrade pip setuptools wheel
 
-# Python 3.11 (deadsnakes)
-RUN add-apt-repository ppa:deadsnakes/ppa -y && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3.11-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# 전용 가상환경 생성 및 활성 경로 설정
-RUN python3.11 -m venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# pip 최신화
-RUN python -m ensurepip && python -m pip install --upgrade pip setuptools wheel
-
-# ✅ cu128 PyTorch 계열 (가상환경에 설치)
+# ✅ Blackwell 대비: 확장 모듈 빌드 시 PTX 폴백 허용
 ENV TORCH_CUDA_ARCH_LIST="12.0+PTX"
-RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+
+# ✅ CUDA 12.8용 PyTorch 스택
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
     torch torchvision torchaudio
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
-# 나머지 파이썬 패키지 (모두 가상환경에)
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt
+# 프로젝트 의존성 먼저 설치 (여기에 faster-whisper==1.0.3 포함)
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# ---- OpenVoice V2 + MeloTTS ----
+# 핵심: OpenVoice를 --no-deps로 설치하여 faster-whisper==0.9.0/av==10.* 강제설치 차단
+RUN git lfs install && \
+    git clone --depth=1 https://github.com/myshell-ai/OpenVoice.git /tmp/OpenVoice && \
+    pip install --no-cache-dir --no-deps -e /tmp/OpenVoice && \
+    pip install --no-cache-dir git+https://github.com/myshell-ai/MeloTTS.git
+
+# (안전하게) 한국어 g2p 보강
+RUN pip install --no-cache-dir jamo==0.4.1 g2pkk>=0.1.1
+
+# OpenVoice V2 체크포인트 미리 다운로드
+RUN python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="myshell-ai/OpenVoiceV2",
+    allow_patterns=["converter/*", "base_speakers/**"],
+    local_dir="/app/assets/openvoice_v2/checkpoints_v2"
+)
+PY
 
 COPY app /app/app
 
