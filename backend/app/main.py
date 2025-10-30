@@ -34,7 +34,7 @@ from .pipeline import (
     dub, asr_only, translate_stage,
     tts_probe_stage, tts_finalize_stage,
     mux_stage, merge_segments_stage,
-    build_voice_sample_stage,
+    build_voice_sample_stage, synthesize_single_text,
 )
 from .utils_meta import load_meta, save_meta
 import shutil
@@ -198,6 +198,20 @@ async def tts_compat_endpoint(
 ):
     out = await tts_finalize_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)
     return {"ok": True, **out}
+
+# 🔊 단일 문장 TTS
+@app.post("/tts-single")
+async def tts_single_endpoint(
+    text: str = Form(..., description="문장 또는 문단"),
+    target_lang: str = Form(..., description="'en' or 'ja' or 'ko'"),
+    ref_voice: UploadFile = File(..., description="참조 목소리 WAV (6초 이상 권장)"),
+):
+    result = synthesize_single_text(text=text, target_lang=target_lang, ref_voice=ref_voice)
+    return FileResponse(
+        result["tts_wav"],
+        media_type="audio/wav",
+        filename=f"tts_{result['job_id']}.wav",
+    )
 
 # 5) MUX
 @app.post("/mux/{job_id}")
