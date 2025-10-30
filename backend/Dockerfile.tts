@@ -1,0 +1,43 @@
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TORCH_CUDA_ARCH_LIST="12.0+PTX"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    build-essential git git-lfs curl ca-certificates \
+    ffmpeg sox libsndfile1 libsndfile1-dev \
+    libgl1 libglib2.0-0 ninja-build cmake pkg-config wget \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-venv python3.11-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN python -m ensurepip && python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision torchaudio
+
+WORKDIR /app
+COPY backend/requirements.tts.txt /app/requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt
+
+COPY backend/app /app/app
+
+ENV HF_HOME=/app/cache/hf \
+    TRANSFORMERS_CACHE=/app/cache/hf \
+    HUGGINGFACE_HUB_CACHE=/app/cache/hf \
+    TTS_HOME=/app/cache/tts \
+    COQUI_TOS_AGREED=1
+
+RUN useradd -m appuser && mkdir -p /app/cache/hf /app/cache/tts && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 9000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]

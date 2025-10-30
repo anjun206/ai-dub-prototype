@@ -1,0 +1,8 @@
+# TTS worker requirements
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+TTS==0.22.0
+soundfile==0.12.1
+requests==2.32.3
