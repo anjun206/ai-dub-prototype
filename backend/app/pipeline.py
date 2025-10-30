@@ -85,7 +85,7 @@ def synthesize_single_text(
     tmp_root: str = "/app/data/tmp",
 ) -> Dict[str, str]:
     """
-    업로드한 참조 음성을 24k/mono (최대 6초)로 준비한 뒤 단일 문장을 합성.
+    업로드한 참조 음성을 그대로 사용해 단일 문장을 합성.
     반환: {"job_id": str, "workdir": str, "tts_wav": str, "ref_wav": str}
     """
     if ref_voice is None:
@@ -109,18 +109,9 @@ def synthesize_single_text(
     with open(raw_ref, "wb") as f:
         shutil.copyfileobj(ref_voice.file, f)
 
-    # 합성에 맞는 포맷으로 6초 컷/리샘플
-    ref_path = os.path.join(workdir, "ref.wav")
-    try:
-        run(
-            f"ffmpeg -y -i {shlex.quote(raw_ref)} -t 6 -ar 24000 -ac 1 {shlex.quote(ref_path)}"
-        )
-    except Exception as err:
-        raise RuntimeError(f"Failed to preprocess reference voice: {err}") from err
-
     out_path = os.path.join(workdir, "tts.wav")
-    synthesize(text, ref_path, language=target_lang, out_path=out_path, model_name=TTS_MODEL)
-    return {"job_id": job_id, "workdir": workdir, "tts_wav": out_path, "ref_wav": ref_path}
+    synthesize(text, raw_ref, language=target_lang, out_path=out_path, model_name=TTS_MODEL)
+    return {"job_id": job_id, "workdir": workdir, "tts_wav": out_path, "ref_wav": raw_ref}
 
 
 # ----------------- 번역 (자동 수정 없음) -----------------
