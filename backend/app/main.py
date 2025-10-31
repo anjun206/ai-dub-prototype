@@ -238,7 +238,7 @@ async def voice_sample_endpoint(
     """
     meta = await asr_only(file)
     job_id = meta["job_id"]
-    out = build_voice_sample_stage(job_id)
+    out = build_voice_sample_stage(job_id)  
     return FileResponse(out["voice_sample_wav"], media_type="audio/wav", filename=f"voice_sample_{job_id}.wav")
 
 

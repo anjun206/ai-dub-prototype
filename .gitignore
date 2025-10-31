@@ -7,6 +7,10 @@
 !Dockerfile
 !docker-compose.yml
 !requirements.txt
+!backend/Dockerfile.api
+!backend/Dockerfile.tts
+!backend/requirements.api.txt
+!backend/requirements.tts.txt
 
 # 2) backend 디렉터리만 통과
 !/backend/
