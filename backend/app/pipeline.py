@@ -6,10 +6,8 @@ import shutil
 import shlex
 from typing import Optional, List, Dict
 
-from faster_whisper import WhisperModel
 from fastapi import UploadFile
 
-from .translate import translate_texts
 from .tts import synthesize
 from .utils import (
     run, ffprobe_duration, make_silence, time_stretch,
@@ -30,8 +28,9 @@ USE_GPU = os.getenv("USE_GPU", "1") == "1"
 _device = "cuda" if USE_GPU else "cpu"
 _compute = "float16" if _device == "cuda" else "int8"
 
-EPS = 0.02  # 20ms 허용오차
+_whisper_model = None  # Lazily populated when ASR is requested
 
+EPS = 0.02  # 20ms 허용오차
 
 # ----------------- 공통 유틸 -----------------
 def _ensure_dir(p):
@@ -57,15 +56,24 @@ def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
     run(f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(vocals_16k_raw)}")
     return full_48k, vocals_48k, bgm_48k, vocals_16k_raw
 
-
 def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
     # 6초 참조 (24k mono)
     run(f"ffmpeg -y -i {audio_wav_16k} -t 6 -ar 24000 -ac 1 {out_ref_24k}")
 
 def _whisper_transcribe(audio_wav_16k: str):
-    model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "ASR requested but faster-whisper is not installed in this environment."
+            ) from e
+        _whisper_model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
+    model = _whisper_model
     segments, info = model.transcribe(audio_wav_16k, language=None, vad_filter=True, word_timestamps=False)
     return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segments]
+
 
 def _ensure_ref_voice(work: str, wav_16k: str, ref_voice: Optional[UploadFile]) -> str:
     ref_path = os.path.join(work, "ref.wav")
@@ -75,7 +83,6 @@ def _ensure_ref_voice(work: str, wav_16k: str, ref_voice: Optional[UploadFile]) 
         return ref_path
     _pick_ref(wav_16k, ref_path)
     return ref_path
-
 
 def synthesize_single_text(
     text: str,
@@ -114,19 +121,30 @@ def synthesize_single_text(
     return {"job_id": job_id, "workdir": workdir, "tts_wav": out_path, "ref_wav": raw_ref}
 
 
+
+def _translate_texts_safe(texts: List[str], src: str, tgt: str) -> List[str]:
+    try:
+        from .translate import translate_texts  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Translation dependencies are missing; install transformers stack to use this endpoint."
+        ) from e
+    return translate_texts(texts, src=src, tgt=tgt)
+
 # ----------------- 번역 (자동 수정 없음) -----------------
 def translate_stage(segments: List[Dict], src: str, tgt: str, length_mode: str = "off") -> List[Dict]:
     """
-    자동 길이 조정/문자 수정 없음.
-    입력 세그먼트의 절대좌표(start,end)를 그대로 복사해 번역 텍스트만 채움.
-    반환: [{"start": float, "end": float, "text": str}, ...]
+    �ڵ� ���� ����/���� ���� ����.
+    �Է� ���׸�Ʈ�� ������ǥ(start,end)�� �״�� ������ ���� �ؽ�Ʈ�� ä��.
+    ��ȯ: [{"start": float, "end": float, "text": str}, ...]
     """
     texts = [s["text"] for s in segments]
-    base = translate_texts(texts, src=src, tgt=tgt)
+    base = _translate_texts_safe(texts, src=src, tgt=tgt)
     outs: List[Dict] = []
     for s, t in zip(segments, base):
         outs.append({"start": s["start"], "end": s["end"], "text": t})
     return outs
+
 
 
 # ----------------- 1차 TTS: 길이 측정(Probe) -----------------
@@ -175,7 +193,6 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
     meta["duration_report"] = report
     save_meta(work, meta)
     return {"workdir": work, "duration_report": report}
-
 
 # ----------------- 2차 TTS: 최종 보정/결합(Finalize) -----------------
 async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[UploadFile]):
@@ -309,7 +326,6 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     save_meta(work, meta)
     return {"workdir": work, "dubbed_wav": dubbed, "final_report": final_report}
 
-
 # ----------------- ASR/번역/원샷 -----------------
 async def asr_only(file: UploadFile) -> Dict:
     job_id = str(uuid.uuid4())[:8]
@@ -383,7 +399,6 @@ async def asr_only(file: UploadFile) -> Dict:
     save_meta(work, meta)
     return meta
 
-
 def mux_stage(job_id: str) -> str:
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
@@ -402,7 +417,6 @@ def mux_stage(job_id: str) -> str:
     meta["output"] = out_video
     save_meta(work, meta)
     return out_video
-
 
 
 # (선택) 원샷 dub: 번역 자동수정 없이, 최종 규칙으로 바로 처리
@@ -425,7 +439,7 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         raise RuntimeError("No speech detected.")
 
     # 4) MT (자동 수정 없음)
-    base = translate_texts([s["text"] for s in segments], src="ko", tgt=target_lang)
+    base = _translate_texts_safe([s["text"] for s in segments], src="ko", tgt=target_lang)
     translations = [{"start": s["start"], "end": s["end"], "text": t} for s, t in zip(segments, base)]
 
     # 5) 합성/보정/결합
@@ -499,7 +513,6 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return meta
 
-
 def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[List[Dict], List[Dict]]:
     """
     merges: [(start_idx, end_idx), ...] 0-based, inclusive, 오름차순/비겹침/연속 범위만 허용
@@ -567,7 +580,6 @@ def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[L
         cur_i += 1
 
     return merged, mapping
-
 
 def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
     work = os.path.join("/app/data", job_id)
@@ -646,7 +658,6 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
 
     save_meta(work, meta)
     return {"segments": merged, "merge_map": merge_map}
-
 
 # ----------------- Voice Sample: 무음 제거 후 음성만 연결 -----------------
 def build_voice_sample_stage(job_id: str, out_sr: int = 24000):
