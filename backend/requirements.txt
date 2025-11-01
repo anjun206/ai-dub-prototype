@@ -20,3 +20,7 @@ cutlet==0.4.0
 fugashi==1.3.2
 unidic-lite==1.0.8
 torchcodec
+
+# Worker dependencies
+boto3==1.34.160
+requests==2.32.3

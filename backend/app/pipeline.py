@@ -52,6 +52,20 @@ def _ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
+def _annotate_segments(segments: List[Dict]) -> List[Dict]:
+    """
+    Ensure downstream metadata consumers receive normalized segment fields.
+    """
+    for idx, seg in enumerate(segments):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        seg["seg_id"] = seg.get("seg_id", idx)
+        seg["length"] = max(0.0, end - start)
+        seg.setdefault("issues", [])
+        seg.setdefault("score", None)
+    return segments
+
+
 def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
     """
     전체 오디오(48k) 추출 → 보이스/배경 분리 → 보이스 16k/mono까지 반환
@@ -465,6 +479,8 @@ async def asr_only(file: UploadFile) -> Dict:
         else:
             segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
+
+    _annotate_segments(segments)
 
     meta = {
         "job_id": job_id,
