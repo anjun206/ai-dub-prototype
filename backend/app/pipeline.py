@@ -660,7 +660,7 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
     return {"segments": merged, "merge_map": merge_map}
 
 # ----------------- Voice Sample: 무음 제거 후 음성만 연결 -----------------
-def build_voice_sample_stage(job_id: str, out_sr: int = 24000):
+def build_voice_sample_stage(job_id: str, out_sr: int = 48000):
     """
     ASR 세그먼트 기준으로 스피치 구간만 잘라 순차적으로 연결한 WAV 생성.
     - 입력: /asr 단계가 완료된 job_id가 있어야 함 (segments, speech_only_48k 필요)
